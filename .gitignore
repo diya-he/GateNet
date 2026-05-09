@@ -1,0 +1,4 @@
+data/
+runs/
+paper/
+*/__pycache__/
