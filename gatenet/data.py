@@ -67,6 +67,36 @@ def polygons_to_mask(polys: Iterable[list[tuple[float, float]]], w: int, h: int)
     return mask
 
 
+def polygons_to_instance_target(
+    polys: Iterable[list[tuple[float, float]]],
+    w: int,
+    h: int,
+    boundary_width: int = 3,
+) -> tuple[Image.Image, Image.Image]:
+    """
+    Make foreground and instance-boundary masks from normalized polygons.
+    """
+    foreground = Image.new("L", (w, h), 0)
+    boundary = Image.new("L", (w, h), 0)
+    fg_draw = ImageDraw.Draw(foreground)
+    bd_draw = ImageDraw.Draw(boundary)
+    line_width = max(1, int(boundary_width))
+
+    for poly in polys:
+        xy = [(max(0.0, min(1.0, x)) * (w - 1), max(0.0, min(1.0, y)) * (h - 1)) for (x, y) in poly]
+        if len(xy) < 3:
+            continue
+        fg_draw.polygon(xy, outline=255, fill=255)
+        closed = xy + [xy[0]]
+        bd_draw.line(closed, fill=255, width=line_width, joint="curve")
+
+    # Keep boundary supervision inside the object area where possible.
+    fg = np.asarray(foreground, dtype=np.uint8)
+    bd = np.asarray(boundary, dtype=np.uint8)
+    bd = np.where(fg > 0, bd, 0).astype(np.uint8)
+    return foreground, Image.fromarray(bd, mode="L")
+
+
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
     arr = np.asarray(img, dtype=np.float32)
     if arr.ndim == 2:
@@ -79,6 +109,18 @@ def resize_pair(img: Image.Image, mask: Image.Image, size: int) -> tuple[Image.I
     img = img.resize((size, size), resample=Image.BILINEAR)
     mask = mask.resize((size, size), resample=Image.NEAREST)
     return img, mask
+
+
+def resize_triplet(
+    img: Image.Image,
+    foreground: Image.Image,
+    boundary: Image.Image,
+    size: int,
+) -> tuple[Image.Image, Image.Image, Image.Image]:
+    img = img.resize((size, size), resample=Image.BILINEAR)
+    foreground = foreground.resize((size, size), resample=Image.NEAREST)
+    boundary = boundary.resize((size, size), resample=Image.NEAREST)
+    return img, foreground, boundary
 
 
 @dataclass(frozen=True)
@@ -94,10 +136,19 @@ class YoloSegFolders:
 class YoloSegDataset(Dataset):
     """
     Dataset for YOLO segmentation polygon labels.
-    Produces (image_tensor, mask_tensor) where mask is binary (1 channel).
+    Produces (image_tensor, target_tensor) where target has:
+      channel 0: foreground mask
+      channel 1: instance boundary mask
     """
 
-    def __init__(self, root: Path, img_size: int = 384, augment: bool = False, seed: int = 0) -> None:
+    def __init__(
+        self,
+        root: Path,
+        img_size: int = 384,
+        augment: bool = False,
+        seed: int = 0,
+        boundary_width: int = 3,
+    ) -> None:
         super().__init__()
         self.root = Path(root)
         self.folders = YoloSegFolders.from_root(self.root)
@@ -105,6 +156,7 @@ class YoloSegDataset(Dataset):
         self.img_size = int(img_size)
         self.augment = bool(augment)
         self.rng = random.Random(seed)
+        self.boundary_width = int(boundary_width)
 
         if not self.img_paths:
             raise FileNotFoundError(f"No images found in: {self.folders.images_dir}")
@@ -112,15 +164,22 @@ class YoloSegDataset(Dataset):
     def __len__(self) -> int:
         return len(self.img_paths)
 
-    def _augment(self, img: Image.Image, mask: Image.Image) -> tuple[Image.Image, Image.Image]:
+    def _augment(
+        self,
+        img: Image.Image,
+        foreground: Image.Image,
+        boundary: Image.Image,
+    ) -> tuple[Image.Image, Image.Image, Image.Image]:
         # Lightweight, deterministic-ish aug to match paper spirit without extra deps.
         if self.rng.random() < 0.5:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+            foreground = foreground.transpose(Image.FLIP_LEFT_RIGHT)
+            boundary = boundary.transpose(Image.FLIP_LEFT_RIGHT)
         if self.rng.random() < 0.1:
             img = img.transpose(Image.FLIP_TOP_BOTTOM)
-            mask = mask.transpose(Image.FLIP_TOP_BOTTOM)
-        return img, mask
+            foreground = foreground.transpose(Image.FLIP_TOP_BOTTOM)
+            boundary = boundary.transpose(Image.FLIP_TOP_BOTTOM)
+        return img, foreground, boundary
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         img_path = self.img_paths[idx]
@@ -129,14 +188,15 @@ class YoloSegDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         w, h = img.size
         polys = _read_yolo_seg_polygons(lbl_path)
-        mask = polygons_to_mask(polys, w=w, h=h)
+        foreground, boundary = polygons_to_instance_target(polys, w=w, h=h, boundary_width=self.boundary_width)
 
-        img, mask = resize_pair(img, mask, self.img_size)
+        img, foreground, boundary = resize_triplet(img, foreground, boundary, self.img_size)
         if self.augment:
-            img, mask = self._augment(img, mask)
+            img, foreground, boundary = self._augment(img, foreground, boundary)
 
         x = pil_to_tensor(img)  # (3,H,W)
-        y = pil_to_tensor(mask)  # (1,H,W), values 0..1
-        y = (y >= 0.5).float()
+        fg = (pil_to_tensor(foreground) >= 0.5).float()
+        bd = (pil_to_tensor(boundary) >= 0.5).float()
+        y = torch.cat([fg, bd], dim=0)  # (2,H,W)
         return x, y
 

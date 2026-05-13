@@ -10,6 +10,8 @@ from PIL import Image, ImageDraw
 
 import onnxruntime as ort
 
+from gatenet.instance_postprocess import label_map_to_color, label_map_to_u16, overlay_instances_on_image, postprocess_instances
+
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -128,12 +130,13 @@ def preprocess(img_path: Path, img_size: int) -> tuple[np.ndarray, tuple[int, in
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="ONNXRuntime inference on YOLO-seg test split (save masks + speed).")
+    ap = argparse.ArgumentParser(description="ONNXRuntime instance inference on YOLO-seg test split.")
     ap.add_argument("--data", type=Path, required=True, help="Split root containing test/images and test/labels")
     ap.add_argument("--onnx", type=Path, required=True, help="ONNX path exported by gatenet.export_onnx")
     ap.add_argument("--out", type=Path, default=Path("runs/onnx_infer_test"))
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--boundary-threshold", type=float, default=0.5)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--min-area", type=int, default=20)
     ap.add_argument("--save-overlay", action="store_true")
@@ -144,9 +147,15 @@ def main() -> None:
 
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "pred_masks").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_foreground").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_boundary").mkdir(parents=True, exist_ok=True)
+    (out_dir / "instance_maps").mkdir(parents=True, exist_ok=True)
+    (out_dir / "instance_color").mkdir(parents=True, exist_ok=True)
     if args.save_orig_size:
-        (out_dir / "pred_masks_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_foreground_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_boundary_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "instance_maps_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "instance_color_orig").mkdir(parents=True, exist_ok=True)
     if args.save_overlay:
         (out_dir / "overlay").mkdir(parents=True, exist_ok=True)
         if args.save_orig_size:
@@ -187,20 +196,31 @@ def main() -> None:
         x, (ow, oh), orig_img = preprocess(img_path, args.img_size)
 
         t0 = time.perf_counter()
-        y4 = sess.run([out_name], {inp_name: x})[0]  # 1x1xHxW, sigmoid already
+        y4 = sess.run([out_name], {inp_name: x})[0]  # 1x2xHxW, sigmoid already
         t1 = time.perf_counter()
         dt_ms = (t1 - t0) * 1000.0
         times_ms.append(float(dt_ms))
 
-        prob = y4[0, 0]
-        pred_bin = (prob >= float(args.threshold)).astype(np.uint8) * 255
+        fg_prob = y4[0, 0]
+        bd_prob = y4[0, 1]
+        pred_bin = (fg_prob >= float(args.threshold)).astype(np.uint8) * 255
+        boundary_bin = (bd_prob >= float(args.boundary_threshold)).astype(np.uint8) * 255
 
-        # save 384 mask
-        Image.fromarray(pred_bin, mode="L").save(out_dir / "pred_masks" / f"{img_path.stem}.png")
+        Image.fromarray(pred_bin, mode="L").save(out_dir / "pred_foreground" / f"{img_path.stem}.png")
+        Image.fromarray(boundary_bin, mode="L").save(out_dir / "pred_boundary" / f"{img_path.stem}.png")
 
         lbl_path = test_labels / f"{img_path.stem}.txt"
         gt_instances = count_yolo_instances(lbl_path)
-        pred_instances = count_connected_components(pred_bin, min_area=args.min_area)
+        label_map, instances = postprocess_instances(
+            fg_prob,
+            bd_prob,
+            threshold=args.threshold,
+            boundary_threshold=args.boundary_threshold,
+            min_area=args.min_area,
+        )
+        pred_instances = len(instances)
+        label_map_to_u16(label_map).save(out_dir / "instance_maps" / f"{img_path.stem}.png")
+        label_map_to_color(label_map).save(out_dir / "instance_color" / f"{img_path.stem}.png")
 
         # GT 384 (for iou_384)
         polys = read_yolo_polys(lbl_path)
@@ -214,13 +234,19 @@ def main() -> None:
 
         if args.save_overlay:
             resized_rgb = orig_img.resize((args.img_size, args.img_size), Image.BILINEAR)
-            overlay = overlay_mask_on_image(resized_rgb, pred_bin)
+            overlay = overlay_instances_on_image(resized_rgb, label_map)
             overlay.save(out_dir / "overlay" / f"{img_path.stem}.png")
 
         iouorig = None
         if args.save_orig_size:
             pred_orig = Image.fromarray(pred_bin, mode="L").resize((ow, oh), Image.NEAREST)
-            pred_orig.save(out_dir / "pred_masks_orig" / f"{img_path.stem}.png")
+            pred_orig.save(out_dir / "pred_foreground_orig" / f"{img_path.stem}.png")
+            boundary_orig = Image.fromarray(boundary_bin, mode="L").resize((ow, oh), Image.NEAREST)
+            boundary_orig.save(out_dir / "pred_boundary_orig" / f"{img_path.stem}.png")
+            label_orig = label_map_to_u16(label_map).resize((ow, oh), Image.NEAREST)
+            label_orig.save(out_dir / "instance_maps_orig" / f"{img_path.stem}.png")
+            label_orig_np = np.asarray(label_orig, dtype=np.uint16).astype(np.int32)
+            label_map_to_color(label_orig_np).save(out_dir / "instance_color_orig" / f"{img_path.stem}.png")
 
             gt_orig = polys_to_mask_pil(polys, w=ow, h=oh)
             gt_orig_u8 = np.asarray(gt_orig, dtype=np.uint8)
@@ -228,7 +254,7 @@ def main() -> None:
                 gt_orig.save(out_dir / "gt_masks_orig" / f"{img_path.stem}.png")
 
             if args.save_overlay:
-                ov_orig = overlay_mask_on_image(orig_img, np.asarray(pred_orig, dtype=np.uint8))
+                ov_orig = overlay_instances_on_image(orig_img, label_orig_np)
                 ov_orig.save(out_dir / "overlay_orig" / f"{img_path.stem}.png")
 
             iouorig = iou_from_u8(np.asarray(pred_orig, dtype=np.uint8), gt_orig_u8)
@@ -243,6 +269,7 @@ def main() -> None:
                 "iou_orig": (float(iouorig) if iouorig is not None else None),
                 "pred_instances": int(pred_instances),
                 "gt_instances": int(gt_instances),
+                "instances": instances,
             }
         )
 
@@ -256,6 +283,7 @@ def main() -> None:
         "providers": sess.get_providers(),
         "img_size": args.img_size,
         "threshold": args.threshold,
+        "boundary_threshold": args.boundary_threshold,
         "count": len(imgs),
         "mean_iou_384": float(np.mean(ious_384)) if ious_384 else None,
         "mean_iou_orig": float(np.mean(ious_orig)) if ious_orig else None,

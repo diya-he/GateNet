@@ -106,13 +106,13 @@ def save_checkpoint(
 
     save_model = model
     if prune_amount is not None and prune_amount > 0:
-        save_model = GateNet(in_channels=3, f=int(meta["f"]))
+        save_model = GateNet(in_channels=3, f=int(meta["f"]), out_channels=int(meta.get("out_channels", 2)))
         save_model.load_state_dict(model.state_dict(), strict=True)
         apply_global_l1_pruning_inplace(save_model, float(prune_amount))
 
     state = save_model.state_dict()
     payload = {
-        "model": "GateNet",
+        "model": "GateNetInstance",
         "state_dict": state,
         "meta": meta,
     }
@@ -122,13 +122,14 @@ def save_checkpoint(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Train GateNet (MonoRace) on YOLO-seg dataset.")
+    ap = argparse.ArgumentParser(description="Train GateNet instance segmentation on YOLO-seg dataset.")
     ap.add_argument("--data", type=Path, required=True, help="Split root containing train/ and test/")
     ap.add_argument("--out", type=Path, default=Path("runs/gatenet"), help="Output directory")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--f", type=int, default=4, help="Channel scale factor f (paper uses 4)")
+    ap.add_argument("--boundary-width", type=int, default=3, help="Boundary target width in pixels before resize")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--device", type=str, default="auto")
@@ -147,13 +148,25 @@ def main() -> None:
 
     train_root = args.data / "train"
     test_root = args.data / "test"
-    ds_train = YoloSegDataset(train_root, img_size=args.img_size, augment=True, seed=args.seed)
-    ds_test = YoloSegDataset(test_root, img_size=args.img_size, augment=False, seed=args.seed)
+    ds_train = YoloSegDataset(
+        train_root,
+        img_size=args.img_size,
+        augment=True,
+        seed=args.seed,
+        boundary_width=args.boundary_width,
+    )
+    ds_test = YoloSegDataset(
+        test_root,
+        img_size=args.img_size,
+        augment=False,
+        seed=args.seed,
+        boundary_width=args.boundary_width,
+    )
 
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     dl_test = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = GateNet(in_channels=3, f=args.f).to(device)
+    model = GateNet(in_channels=3, f=args.f, out_channels=2).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     best_iou = -1.0
@@ -194,11 +207,14 @@ def main() -> None:
             "test_iou": metrics["iou"],
             "img_size": args.img_size,
             "f": args.f,
+            "out_channels": 2,
+            "output_channels": ["foreground", "boundary"],
+            "boundary_width": args.boundary_width,
         }
 
         if args.save_prune_amount and args.save_prune_amount > 0:
             meta = {**meta, **{"save_prune_amount": float(args.save_prune_amount)}}
-            tmp = GateNet(in_channels=3, f=args.f)
+            tmp = GateNet(in_channels=3, f=args.f, out_channels=2)
             tmp.load_state_dict(model.state_dict(), strict=True)
             apply_global_l1_pruning_inplace(tmp, float(args.save_prune_amount))
             meta = {**meta, **pruning_stats(tmp)}

@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 import torch
 
 from gatenet.data import YoloSegDataset
+from gatenet.instance_postprocess import label_map_to_color, label_map_to_u16, overlay_instances_on_image, postprocess_instances
 from gatenet.losses import iou_binary
 from gatenet.model import GateNet
 
@@ -24,8 +25,15 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[GateNet, dict]:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     meta = ckpt.get("meta") or {}
     f = int(meta.get("f", 4))
-    model = GateNet(in_channels=3, f=f).to(device)
-    model.load_state_dict(ckpt["state_dict"], strict=True)
+    state_dict = ckpt["state_dict"]
+    out_channels = int(meta.get("out_channels") or state_dict["outc4.conv.weight"].shape[0])
+    if out_channels != 2:
+        raise ValueError(
+            f"{ckpt_path} is a {out_channels}-channel semantic checkpoint. "
+            "Retrain with the instance model before running instance inference."
+        )
+    model = GateNet(in_channels=3, f=f, out_channels=out_channels).to(device)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model, meta
 
@@ -153,8 +161,9 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--boundary-threshold", type=float, default=0.5)
     ap.add_argument("--warmup", type=int, default=5, help="Warmup iterations (not counted in speed)")
-    ap.add_argument("--min-area", type=int, default=20, help="Min connected-component area to count as an instance")
+    ap.add_argument("--min-area", type=int, default=20, help="Min seed area to keep as an instance")
     ap.add_argument(
         "--save-orig-size",
         action="store_true",
@@ -167,9 +176,15 @@ def main() -> None:
     device = auto_device(args.device)
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "pred_masks").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_foreground").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_boundary").mkdir(parents=True, exist_ok=True)
+    (out_dir / "instance_maps").mkdir(parents=True, exist_ok=True)
+    (out_dir / "instance_color").mkdir(parents=True, exist_ok=True)
     if args.save_orig_size:
-        (out_dir / "pred_masks_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_foreground_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_boundary_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "instance_maps_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "instance_color_orig").mkdir(parents=True, exist_ok=True)
     if args.save_overlay:
         (out_dir / "overlay").mkdir(parents=True, exist_ok=True)
         if args.save_orig_size:
@@ -219,13 +234,27 @@ def main() -> None:
         iou_val = iou_binary(pred, y, thresh=args.threshold)
         ious.append(iou_val)
 
-        pred_bin = (pred[0, 0] >= args.threshold).float()
-        pred_png = tensor_mask_to_pil(pred_bin)
-        pred_png.save(out_dir / "pred_masks" / f"{img_path.stem}.png")
+        fg_prob = pred[0, 0].detach().float().cpu().numpy()
+        bd_prob = pred[0, 1].detach().float().cpu().numpy()
+        pred_bin = (fg_prob >= args.threshold).astype(np.uint8) * 255
+        boundary_bin = (bd_prob >= args.boundary_threshold).astype(np.uint8) * 255
+        pred_png = Image.fromarray(pred_bin, mode="L")
+        boundary_png = Image.fromarray(boundary_bin, mode="L")
+        pred_png.save(out_dir / "pred_foreground" / f"{img_path.stem}.png")
+        boundary_png.save(out_dir / "pred_boundary" / f"{img_path.stem}.png")
 
         gt_label_path = test_root / "labels" / f"{img_path.stem}.txt"
         gt_instances = count_yolo_instances(gt_label_path)
-        pred_instances = count_connected_components(pred_bin, min_area=args.min_area)
+        label_map, instances = postprocess_instances(
+            fg_prob,
+            bd_prob,
+            threshold=args.threshold,
+            boundary_threshold=args.boundary_threshold,
+            min_area=args.min_area,
+        )
+        pred_instances = len(instances)
+        label_map_to_u16(label_map).save(out_dir / "instance_maps" / f"{img_path.stem}.png")
+        label_map_to_color(label_map).save(out_dir / "instance_color" / f"{img_path.stem}.png")
 
         if args.save_gt:
             gt_png = tensor_mask_to_pil(y[0, 0])
@@ -233,14 +262,20 @@ def main() -> None:
 
         if args.save_overlay:
             img_rgb = Image.open(img_path).convert("RGB").resize((args.img_size, args.img_size), Image.BILINEAR)
-            ov = overlay_mask_on_image(img_rgb, pred_bin)
+            ov = overlay_instances_on_image(img_rgb, label_map)
             ov.save(out_dir / "overlay" / f"{img_path.stem}.png")
 
         iou_orig = None
         if args.save_orig_size:
             # pred mask back to original image size
             pred_orig = pred_png.resize((orig_w, orig_h), resample=Image.NEAREST)
-            pred_orig.save(out_dir / "pred_masks_orig" / f"{img_path.stem}.png")
+            pred_orig.save(out_dir / "pred_foreground_orig" / f"{img_path.stem}.png")
+            boundary_orig = boundary_png.resize((orig_w, orig_h), resample=Image.NEAREST)
+            boundary_orig.save(out_dir / "pred_boundary_orig" / f"{img_path.stem}.png")
+            label_orig = label_map_to_u16(label_map).resize((orig_w, orig_h), resample=Image.NEAREST)
+            label_orig.save(out_dir / "instance_maps_orig" / f"{img_path.stem}.png")
+            label_orig_np = np.asarray(label_orig, dtype=np.uint16).astype(np.int32)
+            label_map_to_color(label_orig_np).save(out_dir / "instance_color_orig" / f"{img_path.stem}.png")
 
             # GT mask in original size from polygons (avoids resize artifacts)
             polys = read_yolo_polys(gt_label_path)
@@ -249,8 +284,7 @@ def main() -> None:
                 gt_orig.save(out_dir / "gt_masks_orig" / f"{img_path.stem}.png")
 
             if args.save_overlay:
-                pred_orig_t = torch.from_numpy((np.asarray(pred_orig, dtype=np.uint8) >= 128).astype(np.uint8))
-                ov_orig = overlay_mask_on_image(orig_img, pred_orig_t)
+                ov_orig = overlay_instances_on_image(orig_img, label_orig_np)
                 ov_orig.save(out_dir / "overlay_orig" / f"{img_path.stem}.png")
 
             # Optional IoU computed on original size (pred is resized back; gt is exact polygon render)
@@ -269,6 +303,7 @@ def main() -> None:
                 "iou_orig": iou_orig,
                 "pred_instances": int(pred_instances),
                 "gt_instances": int(gt_instances),
+                "instances": instances,
             }
         )
 
@@ -282,6 +317,7 @@ def main() -> None:
         "device": str(device),
         "img_size": args.img_size,
         "threshold": args.threshold,
+        "boundary_threshold": args.boundary_threshold,
         "count": len(ds),
         "mean_iou": float(np.mean(ious)) if ious else None,
         "mean_ms_per_image": mean_ms,

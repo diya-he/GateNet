@@ -31,6 +31,7 @@ def gatenet_multiscale_loss(
       Ltot = 4*L0 + 2*L1 + sum_{i=2..4} Li
 
     Here L0 corresponds to y0 (deepest, lowest resolution) and uses a downscaled target.
+    For instance segmentation each output has foreground and boundary channels.
     """
     y0, y1, y2, y3, y4 = preds
     outs = [y0, y1, y2, y3, y4]
@@ -53,10 +54,10 @@ def gatenet_multiscale_loss(
 @torch.no_grad()
 def iou_binary(pred: torch.Tensor, target: torch.Tensor, thresh: float = 0.5, eps: float = 1e-6) -> float:
     """
-    pred/target: (B,1,H,W)
+    pred/target: (B,C,H,W). IoU is computed on channel 0 (foreground).
     """
-    p = (pred >= thresh).to(torch.uint8)
-    t = (target >= 0.5).to(torch.uint8)
+    p = (pred[:, :1] >= thresh).to(torch.uint8)
+    t = (target[:, :1] >= 0.5).to(torch.uint8)
     inter = (p & t).sum(dim=(1, 2, 3)).float()
     union = (p | t).sum(dim=(1, 2, 3)).float()
     iou = (inter + eps) / (union + eps)

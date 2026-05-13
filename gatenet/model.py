@@ -50,9 +50,9 @@ class Up(nn.Module):
 
 
 class OutC(nn.Module):
-    def __init__(self, in_ch: int) -> None:
+    def __init__(self, in_ch: int, out_channels: int) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, 1, kernel_size=1)
+        self.conv = nn.Conv2d(in_ch, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.conv(x))
@@ -63,11 +63,13 @@ class GateNet(nn.Module):
     GateNet from MonoRace paper:
     - U-Net style encoder-decoder
     - 5 output maps {y0..y4} at increasing resolutions
-    - deployment uses y0 only (highest resolution)
+    - each map has 2 channels: foreground and instance boundary
+    - deployment uses y4 only (highest resolution)
     """
 
-    def __init__(self, in_channels: int = 3, f: int = 4) -> None:
+    def __init__(self, in_channels: int = 3, f: int = 4, out_channels: int = 2) -> None:
         super().__init__()
+        self.out_channels = int(out_channels)
         c1 = 64 // f
         c2 = 128 // f
         c3 = 256 // f
@@ -84,11 +86,11 @@ class GateNet(nn.Module):
         self.up3 = Up(in_ch=c2, skip_ch=c2, out_ch=c1)   # -> 64/f
         self.up4 = Up(in_ch=c1, skip_ch=c1, out_ch=c1)   # -> 64/f
 
-        self.outc0 = OutC(c4)  # y0 from deepest features
-        self.outc1 = OutC(c3)
-        self.outc2 = OutC(c2)
-        self.outc3 = OutC(c1)
-        self.outc4 = OutC(c1)
+        self.outc0 = OutC(c4, self.out_channels)  # y0 from deepest features
+        self.outc1 = OutC(c3, self.out_channels)
+        self.outc2 = OutC(c2, self.out_channels)
+        self.outc3 = OutC(c1, self.out_channels)
+        self.outc4 = OutC(c1, self.out_channels)
 
         self.apply(self._init_weights)
 
