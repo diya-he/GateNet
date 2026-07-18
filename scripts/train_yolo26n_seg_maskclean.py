@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def use_local_ultralytics(root: Path = Path("ultralytics")) -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    local_root = (repo_root / root).resolve()
+    package_init = local_root / "ultralytics" / "__init__.py"
+    if not package_init.exists():
+        raise FileNotFoundError(f"Local Ultralytics package not found: {package_init}")
+    sys.path.insert(0, str(local_root))
+    os.environ["PYTHONPATH"] = f"{local_root}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
+    return local_root
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Train unchanged YOLO26n-seg with cleaner ring-mask supervision.")
+    ap.add_argument("--data", type=Path, default=Path("data/ultralytics/image1_monorace_aug_yolo26/dataset.yaml"))
+    ap.add_argument("--model", type=Path, default=Path("yolo26n-seg.pt"))
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--imgsz", type=int, default=384)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--cuda-visible-devices", type=str, default="1")
+    ap.add_argument("--device", type=str, default="0")
+    ap.add_argument("--project", type=str, default="runs/yolo26")
+    ap.add_argument("--name", type=str, default="image1_monorace_aug_yolo26n_seg_384_maskclean_mr2")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--mask-ratio", type=int, default=2)
+    ap.add_argument("--overlap-mask", action="store_true", help="Use Ultralytics overlap mask training target.")
+    ap.add_argument("--mosaic", type=float, default=0.0)
+    ap.add_argument("--close-mosaic", type=int, default=0)
+    ap.add_argument("--scale", type=float, default=0.35)
+    ap.add_argument("--translate", type=float, default=0.08)
+    ap.add_argument("--hsv-h", type=float, default=0.015)
+    ap.add_argument("--hsv-s", type=float, default=0.45)
+    ap.add_argument("--hsv-v", type=float, default=0.25)
+    ap.add_argument("--opset", type=int, default=13)
+    ap.add_argument("--topk", type=int, default=30)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--keep-incomplete", action="store_true")
+    ap.add_argument("--ultralytics-root", type=Path, default=Path("ultralytics"))
+    return ap.parse_args()
+
+
+def candidate_run_dirs(project: str, name: str) -> list[Path]:
+    p = Path(project)
+    if p.is_absolute():
+        return [p / name]
+    return [Path("runs/segment") / p / name, p / name]
+
+
+def target_run_dir(project: str, name: str) -> Path:
+    for d in candidate_run_dirs(project, name):
+        if d.exists():
+            return d
+    return candidate_run_dirs(project, name)[0]
+
+
+def results_status(run_dir: Path) -> tuple[int, int | None]:
+    path = run_dir / "results.csv"
+    if not path.exists():
+        return 0, None
+    rows = list(csv.DictReader(path.open("r", encoding="utf-8")))
+    if not rows:
+        return 0, None
+    try:
+        return len(rows), int(float(rows[-1].get("epoch", "")))
+    except ValueError:
+        return len(rows), None
+
+
+def is_complete(run_dir: Path, epochs: int) -> bool:
+    rows, last_epoch = results_status(run_dir)
+    return rows >= epochs or (last_epoch is not None and last_epoch >= epochs)
+
+
+def clean_target_if_needed(run_dir: Path, epochs: int, force: bool, keep_incomplete: bool) -> bool:
+    if not run_dir.exists():
+        return False
+    rows, last_epoch = results_status(run_dir)
+    if force:
+        print(f"Deleting target run because --force is set: {run_dir}")
+        shutil.rmtree(run_dir)
+        return False
+    if is_complete(run_dir, epochs):
+        print(f"Target run already complete: {run_dir} rows={rows} last_epoch={last_epoch}")
+        return True
+    if keep_incomplete:
+        raise RuntimeError(f"Incomplete run exists: {run_dir} rows={rows} last_epoch={last_epoch}")
+    print(f"Deleting incomplete target run: {run_dir} rows={rows} last_epoch={last_epoch}")
+    shutil.rmtree(run_dir)
+    return False
+
+
+def train(args: argparse.Namespace, run_dir: Path) -> Path:
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    from ultralytics import YOLO
+
+    model = YOLO(str(args.model))
+    model.train(
+        data=str(args.data),
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        batch=args.batch,
+        workers=args.workers,
+        device=args.device,
+        project=args.project,
+        name=args.name,
+        exist_ok=True,
+        patience=0,
+        seed=args.seed,
+        overlap_mask=bool(args.overlap_mask),
+        mask_ratio=int(args.mask_ratio),
+        mosaic=float(args.mosaic),
+        close_mosaic=int(args.close_mosaic),
+        scale=float(args.scale),
+        translate=float(args.translate),
+        hsv_h=float(args.hsv_h),
+        hsv_s=float(args.hsv_s),
+        hsv_v=float(args.hsv_v),
+        copy_paste=0.0,
+        mixup=0.0,
+    )
+    save_dir = Path(getattr(model.trainer, "save_dir", run_dir))
+    if not is_complete(save_dir, args.epochs):
+        rows, last_epoch = results_status(save_dir)
+        raise RuntimeError(f"YOLO training did not reach {args.epochs} epochs: {save_dir} rows={rows} last={last_epoch}")
+    return save_dir
+
+
+def export_topk(save_dir: Path, args: argparse.Namespace) -> Path:
+    best = save_dir / "weights" / "best.pt"
+    out = save_dir / "weights" / f"best_trt85_topk{args.topk}.onnx"
+    cmd = [
+        sys.executable,
+        "scripts/export_yolo26_seg_trt85_topk_onnx.py",
+        "--weights",
+        str(best),
+        "--imgsz",
+        str(args.imgsz),
+        "--topk",
+        str(args.topk),
+        "--opset",
+        str(args.opset),
+        "--device",
+        "cpu",
+        "--branch",
+        "one2one",
+        "--out",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True)
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    local_root = use_local_ultralytics(args.ultralytics_root)
+    print(f"Using local Ultralytics: {local_root}")
+    run_dir = target_run_dir(args.project, args.name)
+    complete = clean_target_if_needed(run_dir, args.epochs, args.force, args.keep_incomplete)
+    save_dir = run_dir if complete else train(args, run_dir)
+    onnx_path = export_topk(save_dir, args)
+    print(f"YOLO run: {save_dir}")
+    print(f"Best checkpoint: {save_dir / 'weights' / 'best.pt'}")
+    print(f"TRT8.5 TopK ONNX: {onnx_path}")
+
+
+if __name__ == "__main__":
+    main()

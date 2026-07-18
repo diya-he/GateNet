@@ -64,6 +64,78 @@ def count_yolo_instances(label_path: Path) -> int:
     return n
 
 
+def parse_class_ids_arg(value: str, labels_dir: Path) -> list[int]:
+    if value.strip().lower() == "auto":
+        ids: set[int] = set()
+        for label_path in labels_dir.glob("*.txt"):
+            text = label_path.read_text(encoding="utf-8").strip()
+            if not text:
+                continue
+            for line in text.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 7:
+                    ids.add(int(float(parts[0])))
+        return sorted(ids) or [0]
+    ids: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if part:
+            ids.append(int(part))
+    return sorted(dict.fromkeys(ids)) or [0]
+
+
+def output_layout_from_channels(num_channels: int, class_ids: list[int]) -> str:
+    if num_channels <= 2:
+        return "legacy"
+    if num_channels == len(class_ids) + 4:
+        return "class_masks_boundary_hole_offset"
+    if num_channels == len(class_ids) + 3:
+        return "class_masks_boundary_offset"
+    return "class_masks_boundary_center"
+
+
+def split_output_np(
+    y4: np.ndarray,
+    class_ids: list[int],
+    output_layout: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray, list[int], str, np.ndarray | None]:
+    arr = y4[0]
+    if arr.shape[0] <= 2:
+        return arr[0], arr[1], None, None, arr[0:1], class_ids or [0], "legacy", None
+
+    layout = output_layout or output_layout_from_channels(arr.shape[0], class_ids)
+    if layout == "class_masks_boundary_hole_offset":
+        n_cls = arr.shape[0] - 4
+    elif layout == "class_masks_boundary_offset":
+        n_cls = arr.shape[0] - 3
+    else:
+        n_cls = arr.shape[0] - 2
+    if len(class_ids) != n_cls:
+        class_ids = list(range(n_cls))
+    class_probs = arr[:n_cls]
+    fg_prob = class_probs.max(axis=0)
+    bd_prob = arr[n_cls]
+    if layout == "class_masks_boundary_hole_offset":
+        hole_prob = arr[n_cls + 1]
+        offset_xy = arr[n_cls + 2 : n_cls + 4]
+        return fg_prob, bd_prob, None, offset_xy, class_probs, class_ids, layout, hole_prob
+    if layout == "class_masks_boundary_offset":
+        offset_xy = arr[n_cls + 1 : n_cls + 3]
+        return fg_prob, bd_prob, None, offset_xy, class_probs, class_ids, layout, None
+    center_prob = arr[n_cls + 1]
+    return fg_prob, bd_prob, center_prob, None, class_probs, class_ids, layout, None
+
+
+def instance_class_counts(instances: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for inst in instances:
+        if "class_id" not in inst:
+            continue
+        key = str(inst["class_id"])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def polys_to_mask_pil(polys: list[list[tuple[float, float]]], w: int, h: int) -> Image.Image:
     mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
@@ -137,8 +209,14 @@ def main() -> None:
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--boundary-threshold", type=float, default=0.5)
+    ap.add_argument("--center-threshold", type=float, default=0.45)
+    ap.add_argument("--hole-threshold", type=float, default=0.45)
+    ap.add_argument("--vote-bin", type=int, default=8)
+    ap.add_argument("--vote-min-count", type=int, default=None)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--min-area", type=int, default=20)
+    ap.add_argument("--seed-min-area", type=int, default=3)
+    ap.add_argument("--class-ids", type=str, default="auto", help="Comma-separated original YOLO class ids, or auto from test labels")
     ap.add_argument("--save-overlay", action="store_true")
     ap.add_argument("--save-gt", action="store_true")
     ap.add_argument("--save-orig-size", action="store_true")
@@ -149,11 +227,19 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "pred_foreground").mkdir(parents=True, exist_ok=True)
     (out_dir / "pred_boundary").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_center").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_hole").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_offset_x").mkdir(parents=True, exist_ok=True)
+    (out_dir / "pred_offset_y").mkdir(parents=True, exist_ok=True)
     (out_dir / "instance_maps").mkdir(parents=True, exist_ok=True)
     (out_dir / "instance_color").mkdir(parents=True, exist_ok=True)
     if args.save_orig_size:
         (out_dir / "pred_foreground_orig").mkdir(parents=True, exist_ok=True)
         (out_dir / "pred_boundary_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_center_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_hole_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_offset_x_orig").mkdir(parents=True, exist_ok=True)
+        (out_dir / "pred_offset_y_orig").mkdir(parents=True, exist_ok=True)
         (out_dir / "instance_maps_orig").mkdir(parents=True, exist_ok=True)
         (out_dir / "instance_color_orig").mkdir(parents=True, exist_ok=True)
     if args.save_overlay:
@@ -178,9 +264,11 @@ def main() -> None:
 
     test_images = args.data / "test" / "images"
     test_labels = args.data / "test" / "labels"
+    class_ids = parse_class_ids_arg(args.class_ids, test_labels)
     imgs = list_images(test_images)
     if not imgs:
         raise SystemExit(f"No images found in {test_images}")
+    output_layout: str | None = None
 
     # Warmup
     for i in range(min(args.warmup, len(imgs))):
@@ -201,22 +289,52 @@ def main() -> None:
         dt_ms = (t1 - t0) * 1000.0
         times_ms.append(float(dt_ms))
 
-        fg_prob = y4[0, 0]
-        bd_prob = y4[0, 1]
+        fg_prob, bd_prob, center_prob, offset_xy, class_probs, class_ids, output_layout, hole_prob = split_output_np(
+            y4,
+            class_ids=class_ids,
+            output_layout=output_layout,
+        )
         pred_bin = (fg_prob >= float(args.threshold)).astype(np.uint8) * 255
         boundary_bin = (bd_prob >= float(args.boundary_threshold)).astype(np.uint8) * 255
 
         Image.fromarray(pred_bin, mode="L").save(out_dir / "pred_foreground" / f"{img_path.stem}.png")
         Image.fromarray(boundary_bin, mode="L").save(out_dir / "pred_boundary" / f"{img_path.stem}.png")
+        center_png = None
+        if center_prob is not None:
+            center_bin = (center_prob >= float(args.center_threshold)).astype(np.uint8) * 255
+            center_png = Image.fromarray(center_bin, mode="L")
+            center_png.save(out_dir / "pred_center" / f"{img_path.stem}.png")
+        hole_png = None
+        if hole_prob is not None:
+            hole_bin = (hole_prob >= float(args.hole_threshold)).astype(np.uint8) * 255
+            hole_png = Image.fromarray(hole_bin, mode="L")
+            hole_png.save(out_dir / "pred_hole" / f"{img_path.stem}.png")
+        offset_pngs = None
+        if offset_xy is not None:
+            offset_x_png = Image.fromarray(np.clip((offset_xy[0] * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8), mode="L")
+            offset_y_png = Image.fromarray(np.clip((offset_xy[1] * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8), mode="L")
+            offset_x_png.save(out_dir / "pred_offset_x" / f"{img_path.stem}.png")
+            offset_y_png.save(out_dir / "pred_offset_y" / f"{img_path.stem}.png")
+            offset_pngs = (offset_x_png, offset_y_png)
 
         lbl_path = test_labels / f"{img_path.stem}.txt"
         gt_instances = count_yolo_instances(lbl_path)
         label_map, instances = postprocess_instances(
             fg_prob,
             bd_prob,
+            center_prob=center_prob,
+            hole_prob=hole_prob,
+            offset_xy=offset_xy,
+            class_probs=class_probs,
+            class_ids=class_ids,
             threshold=args.threshold,
             boundary_threshold=args.boundary_threshold,
+            center_threshold=args.center_threshold,
+            hole_threshold=args.hole_threshold,
             min_area=args.min_area,
+            seed_min_area=args.seed_min_area,
+            vote_bin=args.vote_bin,
+            vote_min_count=args.vote_min_count,
         )
         pred_instances = len(instances)
         label_map_to_u16(label_map).save(out_dir / "instance_maps" / f"{img_path.stem}.png")
@@ -239,14 +357,23 @@ def main() -> None:
 
         iouorig = None
         if args.save_orig_size:
-            pred_orig = Image.fromarray(pred_bin, mode="L").resize((ow, oh), Image.NEAREST)
-            pred_orig.save(out_dir / "pred_foreground_orig" / f"{img_path.stem}.png")
             boundary_orig = Image.fromarray(boundary_bin, mode="L").resize((ow, oh), Image.NEAREST)
             boundary_orig.save(out_dir / "pred_boundary_orig" / f"{img_path.stem}.png")
+            if center_png is not None:
+                center_orig = center_png.resize((ow, oh), Image.NEAREST)
+                center_orig.save(out_dir / "pred_center_orig" / f"{img_path.stem}.png")
+            if hole_png is not None:
+                hole_orig = hole_png.resize((ow, oh), Image.NEAREST)
+                hole_orig.save(out_dir / "pred_hole_orig" / f"{img_path.stem}.png")
+            if offset_pngs is not None:
+                offset_pngs[0].resize((ow, oh), Image.NEAREST).save(out_dir / "pred_offset_x_orig" / f"{img_path.stem}.png")
+                offset_pngs[1].resize((ow, oh), Image.NEAREST).save(out_dir / "pred_offset_y_orig" / f"{img_path.stem}.png")
             label_orig = label_map_to_u16(label_map).resize((ow, oh), Image.NEAREST)
             label_orig.save(out_dir / "instance_maps_orig" / f"{img_path.stem}.png")
             label_orig_np = np.asarray(label_orig, dtype=np.uint16).astype(np.int32)
             label_map_to_color(label_orig_np).save(out_dir / "instance_color_orig" / f"{img_path.stem}.png")
+            pred_orig_u8 = np.where(label_orig_np > 0, 255, 0).astype(np.uint8)
+            Image.fromarray(pred_orig_u8, mode="L").save(out_dir / "pred_foreground_orig" / f"{img_path.stem}.png")
 
             gt_orig = polys_to_mask_pil(polys, w=ow, h=oh)
             gt_orig_u8 = np.asarray(gt_orig, dtype=np.uint8)
@@ -257,7 +384,7 @@ def main() -> None:
                 ov_orig = overlay_instances_on_image(orig_img, label_orig_np)
                 ov_orig.save(out_dir / "overlay_orig" / f"{img_path.stem}.png")
 
-            iouorig = iou_from_u8(np.asarray(pred_orig, dtype=np.uint8), gt_orig_u8)
+            iouorig = iou_from_u8(pred_orig_u8, gt_orig_u8)
             ious_orig.append(iouorig)
 
         per_image.append(
@@ -269,6 +396,7 @@ def main() -> None:
                 "iou_orig": (float(iouorig) if iouorig is not None else None),
                 "pred_instances": int(pred_instances),
                 "gt_instances": int(gt_instances),
+                "class_counts": instance_class_counts(instances),
                 "instances": instances,
             }
         )
@@ -284,6 +412,12 @@ def main() -> None:
         "img_size": args.img_size,
         "threshold": args.threshold,
         "boundary_threshold": args.boundary_threshold,
+        "center_threshold": args.center_threshold,
+        "hole_threshold": args.hole_threshold,
+        "vote_bin": args.vote_bin,
+        "vote_min_count": args.vote_min_count,
+        "output_layout": output_layout,
+        "class_ids": class_ids,
         "count": len(imgs),
         "mean_iou_384": float(np.mean(ious_384)) if ious_384 else None,
         "mean_iou_orig": float(np.mean(ious_orig)) if ious_orig else None,
@@ -292,6 +426,7 @@ def main() -> None:
         "p90_ms_per_image": p90_ms,
         "fps": fps,
         "min_area": args.min_area,
+        "seed_min_area": args.seed_min_area,
         "save_orig_size": bool(args.save_orig_size),
         "per_image": per_image,
     }
@@ -301,4 +436,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

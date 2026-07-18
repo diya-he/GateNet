@@ -4,14 +4,17 @@ This repo contains a lightweight gate instance-segmentation training pipeline ba
 **GateNet** architecture described in `paper/monorace.pdf` (U-Net style, 5 multi-scale
 outputs, Dice+BCE).
 
-The model predicts two channels at each scale:
+The backbone stays the same as MonoRace GateNet: `384x384`, `f=4`, five multi-scale
+outputs, Xavier init, AdamW, and Dice+BCE supervision. The instance head is widened
+slightly so the model predicts:
 
-- `foreground`: gate/object foreground probability
+- `class_<id>`: one foreground probability map per original YOLO class id
 - `boundary`: instance boundary probability
+- `center`: compact per-instance seed probability
 
-Post-processing converts these two maps into instance IDs by thresholding foreground,
-removing predicted boundaries to create instance seeds, then growing each seed back into
-the foreground mask. `results.json` reports `pred_instances` for every image.
+Post-processing converts these maps into instance IDs by growing predicted `center`
+seeds through non-boundary foreground, then assigning each instance a `class_id` from
+the average class probabilities. Legacy two-channel checkpoints still work.
 
 ## Dataset
 
@@ -29,9 +32,12 @@ Each label line:
 <class_id> <x1> <y1> <x2> <y2> ...   # normalized to [0,1]
 ```
 
-Each line is treated as one instance. The trainer turns the polygons into a foreground
-mask plus a boundary mask, so you can train instance separation from standard YOLO-seg
-labels without changing the dataset layout.
+Each line is treated as one instance. The trainer turns the polygons into per-class
+foreground masks plus boundary and center-seed masks, so you can train instance
+separation from standard YOLO-seg labels without changing the dataset layout.
+
+Class ids are kept as their original YOLO ids. With `--class-ids auto`, the trainer scans
+the labels and writes the class id list into the checkpoint metadata.
 
 ## Split train/test
 
@@ -54,11 +60,16 @@ pip install -r requirements.txt
 python -m gatenet.train \
   --data data/splits/image1 \
   --epochs 100 --batch-size 16 --img-size 384 --f 4 \
-  --boundary-width 3 \
+  --boundary-width 3 --center-radius 0.12 --class-ids auto \
   --lr 1e-3 --device auto \
   --out runs/gatenet_image1 \
   --save-prune-amount 0.3
 ```
+
+Training-time augmentation follows the MonoRace paper's dataloader strategy: random
+affine/perspective geometry, HSV perturbation, directional brightness gradients, motion
+blur with 5-15 px kernels, Gaussian blur, additive Gaussian noise, lens distortion, and
+rolling-shutter-like row shifts.
 
 Outputs:
 - `runs/.../best_pruned.pt`: best checkpoint (by IoU on test) with **pruning** applied
@@ -72,13 +83,15 @@ python -m gatenet.infer_test \
   --ckpt runs/gatenet_image1/best_pruned.pt \
   --out runs/gatenet_image1/test_infer \
   --device auto \
-  --threshold 0.5 --boundary-threshold 0.5 --min-area 20 \
+  --threshold 0.5 --boundary-threshold 0.5 --center-threshold 0.45 \
+  --min-area 20 --seed-min-area 3 \
   --save-overlay --save-gt
 ```
 
 Outputs:
 - `.../pred_foreground/*.png`: predicted foreground binary masks
 - `.../pred_boundary/*.png`: predicted boundary binary masks
+- `.../pred_center/*.png`: predicted center-seed binary masks
 - `.../instance_maps/*.png`: 16-bit PNG where pixel value is the instance id (`0` = background)
 - `.../instance_color/*.png`: colorized instance preview
 - `.../gt_masks/*.png`: GT masks (optional)
@@ -89,7 +102,8 @@ In `results.json`, each `per_image` item includes:
 
 - `pred_instances`: number of predicted instances
 - `gt_instances`: number of YOLO label lines
-- `instances`: each predicted instance's id, area and bounding box
+- `class_counts`: predicted instance count per original class id
+- `instances`: each predicted instance's id, class id, class score, area and bounding box
 
 ## Export ONNX + ONNXRuntime inference
 
@@ -110,7 +124,8 @@ python -m gatenet.infer_onnx_test \
   --onnx runs/gatenet_image1/gatenet_instance_y4.onnx \
   --out runs/gatenet_image1/test_infer_onnx \
   --providers auto \
-  --threshold 0.5 --boundary-threshold 0.5 --min-area 20 \
+  --threshold 0.5 --boundary-threshold 0.5 --center-threshold 0.45 \
+  --min-area 20 --seed-min-area 3 --class-ids auto \
   --save-overlay --save-gt --save-orig-size
 ```
 
@@ -123,4 +138,3 @@ The ONNX preprocessing is:
 
 The ONNX post-processing matches PyTorch inference and writes the same output folders,
 including `instance_maps`, `instance_color`, overlays and `results.json`.
-

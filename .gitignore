@@ -2,3 +2,5 @@ data/
 runs/
 */__pycache__/
 .vscode
+ultralytics
+tmp
