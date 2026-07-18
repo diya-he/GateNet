@@ -16,6 +16,38 @@ Post-processing converts these maps into instance IDs by growing predicted `cent
 seeds through non-boundary foreground, then assigning each instance a `class_id` from
 the average class probabilities. Legacy two-channel checkpoints still work.
 
+## YOLO version
+
+This repo includes a local Ultralytics checkout at `ultralytics/` with
+`ultralytics.__version__ == 8.4.90`. YOLO comparison/training/export scripts use this
+local package by default via `--ultralytics-root ultralytics`, and the included YOLO
+baseline is YOLO26 segmentation (`yolo26n-seg.pt` and the custom YOLO26 gate-lite seg
+configs under `ultralytics/ultralytics/cfg/models/26/`).
+
+## YOLO26 gate-lite segmentation changes
+
+The local Ultralytics checkout contains a customized YOLO26 segmentation baseline for
+gate masks. The goal is to spend more resolution on the mask prototype branch while
+making the rest of the network lighter:
+
+- `yolo26-gate-lite-seg.yaml` keeps the YOLO26 `Segment26` head but uses a smaller
+  scale (`depth=0.50`, `width=0.125`, `max_channels=512`) and fewer mask channels
+  (`nm=16`, `npr=128`) than the stock YOLO26n-seg (`width=0.25`, `max_channels=1024`,
+  `nm=32`, `npr=256`).
+- `yolo26-gate-lite-himask-seg.yaml` uses the same light backbone/head width, but swaps
+  the head to `Segment26HighRes` with `proto_scale=2`. For `384x384` input this raises
+  the mask prototype map from the normal stride-4 size (`96x96`) to `192x192`.
+- `Proto26HighRes` adds only a lightweight interpolation/refinement stage after the
+  standard prototype branch, so the masks keep finer boundaries without paying for a
+  full-size heavy YOLO26 segmentation network.
+- Training uses `mask_ratio=1` in `scripts/train_yolo26_gate_lite_himask_seg.py`, so
+  supervision keeps full mask detail for thin gate/ring structures.
+
+In short: the detector/feature extractor is made narrower for speed, while the mask
+prototype branch is given higher spatial resolution where segmentation quality is most
+sensitive. This makes the YOLO baseline better suited for efficient gate instance
+segmentation and TensorRT-oriented deployment.
+
 ## Dataset
 
 Expected YOLO-seg folder layout:
